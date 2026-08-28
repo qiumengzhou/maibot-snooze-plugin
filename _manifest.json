@@ -1,0 +1,33 @@
+{
+	"manifest_version": 2,
+	"version": "1.0.0",
+	"name": "打盹儿",
+	"description": "模拟人类作息的睡眠管理插件，支持会话隔离与起床气。",
+	"author": {
+		"name": "qiumengzhou",
+		"url": "https://github.com/qiumengzhou"
+	},
+	"license": "GPL-v3.0-or-later",
+	"urls": {
+		"repository": "https://github.com/qiumengzhou/maibot-snooze-plugin",
+		"homepage": "https://github.com/qiumengzhou/maibot-snooze-plugin",
+		"issues": "https://github.com/qiumengzhou/maibot-snooze-plugin/issues"
+	},
+	"changelog": "CHANGELOG.md",
+	"host_application": {
+		"min_version": "1.0.0",
+		"max_version": "1.2.99"
+	},
+	"sdk": {
+		"min_version": "2.0.0",
+		"max_version": "2.99.99"
+	},
+	"dependencies": [],
+	"capabilities": [],
+	"i18n": {
+		"default_locale": "zh-CN",
+		"locales_path": "_locales",
+		"supported_locales": ["zh-CN"]
+	},
+	"id": "maibot_snooze_plugin"
+}
