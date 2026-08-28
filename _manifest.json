@@ -23,11 +23,11 @@
 		"max_version": "2.99.99"
 	},
 	"dependencies": [],
-	"capabilities": [],
+	"capabilities": ["send.text"],
 	"i18n": {
 		"default_locale": "zh-CN",
 		"locales_path": "_locales",
 		"supported_locales": ["zh-CN"]
 	},
-	"id": "maibot_snooze_plugin"
+	"id": "maibot.snooze_plugin"
 }

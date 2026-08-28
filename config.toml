@@ -1,3 +1,29 @@
 [plugin]
-enabled = false
+enabled = true
 config_version = "1.0.0"
+
+[filter]
+group_filter = "whitelist"
+group_ids = []
+pm_filter = "whitelist"
+pm_ids = []
+
+[wake]
+slot_minutes = 30
+wake_start = "07:00"
+snooze_prob = 0.3
+force_wake = true
+force_wake_time = "11:00"
+
+[sleep]
+sleep_start = "21:00"
+stay_prob = 0.2
+force_sleep = true
+force_sleep_time = "04:00"
+
+[pissed]
+ping_threshold = 3
+ping_wake_prob = 0.6
+angry_prefix = "你被吵醒了，现在极度愤怒，语气必须非常不善！"
+anger_slots = 1
+resleep_prob = 0.2
