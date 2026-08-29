@@ -6,15 +6,17 @@
     - 模拟人类作息，在设定的睡觉时间内自动进入"睡觉"状态，完全静默不回复
     - 在起床时间通过概率"贪睡"或"起床"，模拟赖床行为
     - 在睡觉时间通过概率"熬夜"或"入睡"，模拟熬夜行为
-    - 被 @ 多次可概率吵醒，吵醒后进入"生气"状态并注入自定义语气前缀
+    - 被 @/戳 多次可概率吵醒，吵醒后进入"生气"状态并注入自定义语气前缀
     - 生气状态持续一定时间后自动"消气"，期间可概率"补觉"重新入睡
     - 群聊和私聊状态完全隔离，不同群聊互不影响
     - 支持黑白名单控制生效范围（群聊和私聊分开设置）
     - 状态变更时自动发送预设消息：睡醒发"早ﾉ☀"，入睡发"Zzz🌙"，被吵醒发"白金吵闹💢"
+    - 戳一戳（Poke）与 @ 同等对待，累计计数可吵醒
 """
 
 import asyncio
 import random
+import re
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 
@@ -31,13 +33,13 @@ from .models import (
 class StateManager:
     """
     会话状态池管理
-    每个会话存储：状态对象 + stream_id（MaiBot内部格式）
+    每个会话存储：状态对象 + stream_id
     """
     def __init__(self):
         self._sessions: Dict[str, Dict[str, Any]] = {}
 
     def get_or_create(self, session_id: str) -> SessionState:
-        """获取或创建会话状态对象。"""
+        """获取或创建会话状态对象"""
         if session_id not in self._sessions:
             self._sessions[session_id] = {
                 "state": SessionState(),
@@ -46,27 +48,27 @@ class StateManager:
         return self._sessions[session_id]["state"]
 
     def update(self, session_id: str, state: SessionState) -> None:
-        """更新会话状态。"""
+        """更新会话状态"""
         if session_id not in self._sessions:
             self._sessions[session_id] = {"state": state, "stream_id": ""}
         else:
             self._sessions[session_id]["state"] = state
 
     def set_stream_id(self, session_id: str, stream_id: str) -> None:
-        """存储会话对应的真实 stream_id（MaiBot内部格式）。"""
+        """存储会话对应的真实 stream_id（MaiBot内部格式）"""
         if session_id not in self._sessions:
             self._sessions[session_id] = {"state": SessionState(), "stream_id": stream_id}
         else:
             self._sessions[session_id]["stream_id"] = stream_id
 
     def get_stream_id(self, session_id: str) -> str:
-        """获取会话对应的真实 stream_id。"""
+        """获取会话对应的真实 stream_id"""
         if session_id in self._sessions:
             return self._sessions[session_id].get("stream_id", "")
         return ""
 
     def get_all_ids(self) -> list:
-        """获取所有会话 ID。"""
+        """获取所有会话 ID"""
         return list(self._sessions.keys())
 
 
@@ -91,7 +93,7 @@ class SnoozePlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         """处理插件加载"""
-        self.ctx.logger.info("[Snooze] 插件加载完成，开始作息调度。")
+        self.ctx.logger.info("[Snooze] 插件加载完成，开始作息调度")
 
         # ---- 主动初始化配置中的群聊 ----
         for gid in self.config.filter.group_ids:
@@ -101,18 +103,18 @@ class SnoozePlugin(MaiBotPlugin):
         self._timer_task = asyncio.create_task(self._timer_loop())
 
     async def on_unload(self) -> None:
-        """处理插件卸载。"""
+        """处理插件卸载"""
         if self._timer_task:
             self._timer_task.cancel()
             try:
                 await self._timer_task
             except asyncio.CancelledError:
                 pass
-        self.ctx.logger.info("[Snooze] 插件已卸载。")
+        self.ctx.logger.info("[Snooze] 插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         """处理配置热重载事件。"""
-        self.ctx.logger.info("[Snooze] 配置已更新。")
+        self.ctx.logger.info("[Snooze] 配置已更新")
 
     # =========================================================
     # 定时器循环
@@ -173,11 +175,6 @@ class SnoozePlugin(MaiBotPlugin):
     async def handle_message(self, message: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any] | None:
         """
         处理所有入站消息，根据作息状态决定拦截或放行。
-
-        返回值格式:
-            - None: 放行，不影响后续处理
-            - {"action": "abort"}: 拦截，中止后续处理
-            - {"action": "continue", "modified_kwargs": {"message": modified_message}}: 放行并修改消息
         """
         self.ctx.logger.debug("[Snooze] handle_message 被调用")
 
@@ -237,8 +234,8 @@ class SnoozePlugin(MaiBotPlugin):
             return await self._handle_sleeping(message, session_id, state)
 
         if state.is_pissed():
-            self.ctx.logger.debug(f"[{session_id}] 状态: 吵醒，放行（情绪由 planner 注入）")
-            # ★ 不再修改用户消息，直接放行，情绪由另一个 Hook 注入
+            self.ctx.logger.debug(f"[{session_id}] 状态: 吵醒，放行")
+            # 不再修改用户消息，直接放行，情绪由另一个 Hook 注入
             return None
 
         return None
@@ -270,14 +267,15 @@ class SnoozePlugin(MaiBotPlugin):
         session_id: str,
         state: SessionState
     ) -> dict[str, Any] | None:
-        """处理睡觉状态下的@计数和吵醒"""
+        """处理睡觉状态下的 @/戳 计数和吵醒"""
         now = datetime.now()
         cfg = self.config
 
-        is_mentioned = self._is_mentioned(message)
+        # 检测 @/戳
+        is_triggered = self._is_mentioned_or_poked(message)
 
-        if not is_mentioned:
-            self.ctx.logger.info(f"[{session_id}] 🛌 睡觉中，拦截消息（未被@）")
+        if not is_triggered:
+            self.ctx.logger.info(f"[{session_id}] 睡觉中，拦截消息")
             return {"action": "abort"}
 
         # 滑动窗口计数
@@ -293,7 +291,8 @@ class SnoozePlugin(MaiBotPlugin):
         state.ping_count += 1
         self.state_manager.update(session_id, state)
 
-        self.ctx.logger.info(f"[{session_id}] 🛌 睡觉中，收到 @，计数 {state.ping_count}/{cfg.pissed.ping_threshold}")
+        # [修改] 日志改为 @/戳
+        self.ctx.logger.info(f"[{session_id}] 睡觉中，收到 @/戳，计数 {state.ping_count}/{cfg.pissed.ping_threshold}")
 
         # 达到阈值 && 概率命中 -> 吵醒
         if state.ping_count >= cfg.pissed.ping_threshold and random.random() < cfg.pissed.ping_wake_prob:
@@ -306,7 +305,8 @@ class SnoozePlugin(MaiBotPlugin):
             )
             self.state_manager.update(session_id, new_state)
 
-            self.ctx.logger.info(f"[{session_id}] 🔥 被@吵醒！")
+            # [修改] 日志改为 @/戳
+            self.ctx.logger.info(f"[{session_id}] 被@/戳吵醒")
 
             # ---- ★ 只发送预设消息，不修改用户消息 ----
             stream_id = self.state_manager.get_stream_id(session_id)
@@ -319,7 +319,7 @@ class SnoozePlugin(MaiBotPlugin):
             return {"action": "abort"}
 
         # 未达阈值或概率未命中 -> 拦截
-        self.ctx.logger.info(f"[{session_id}] 🛌 睡觉中，@计数 {state.ping_count}/{cfg.pissed.ping_threshold}，拦截")
+        self.ctx.logger.info(f"[{session_id}] 睡觉中，@/戳计数 {state.ping_count}/{cfg.pissed.ping_threshold}，拦截")
         return {"action": "abort"}
 
     # =========================================================
@@ -408,7 +408,6 @@ class SnoozePlugin(MaiBotPlugin):
                 return sid
 
         # 尝试从 session_id 中提取数字（群号/用户号）
-        import re
         match = re.search(r'\d+', session_id)
         if match:
             extracted = match.group()
@@ -421,8 +420,24 @@ class SnoozePlugin(MaiBotPlugin):
         return ""
 
     # =========================================================
-    # @检测
+    # @/戳 检测方法
     # =========================================================
+
+    def _is_mentioned_or_poked(self, message: dict[str, Any]) -> bool:
+        """
+        检测消息是否@了Bot，或者戳了Bot。
+
+        返回 True 表示触发了（被@或被戳且目标为Bot）。
+        """
+        # 先检测 @
+        if self._is_mentioned(message):
+            return True
+
+        # 再检测戳一戳
+        if self._is_poked(message):
+            return True
+
+        return False
 
     def _is_mentioned(self, message: dict[str, Any]) -> bool:
         """检测消息中是否@了Bot。"""
@@ -430,12 +445,66 @@ class SnoozePlugin(MaiBotPlugin):
         if not mentions:
             return False
 
+        bot_id = self._get_bot_id(message)
+        if bot_id is None:
+            # 无法获取bot_id，宁滥勿缺
+            return True
+        return bot_id in mentions
+
+    def _is_poked(self, message: dict[str, Any]) -> bool:
+        """检测消息是否为戳一戳事件，且目标是Bot。"""
+        # 1. 必须为 notify 事件
+        if not message.get("is_notify"):
+            return False
+
+        # 2. 检查 additional_config
+        msg_info = message.get("message_info")
+        if not isinstance(msg_info, dict):
+            return False
+        additional = msg_info.get("additional_config")
+        if not isinstance(additional, dict):
+            return False
+
+        # 3. 必须为 poke 子类型
+        if additional.get("napcat_notice_type") != "notify":
+            return False
+        if additional.get("napcat_notice_sub_type") != "poke":
+            return False
+
+        # 4. 提取 payload
+        payload = additional.get("napcat_notice_payload")
+        if not isinstance(payload, dict):
+            return False
+
+        self_id = str(payload.get("self_id") or "").strip()
+        target_id = str(payload.get("target_id") or "").strip()
+
+        # 必须包含 self_id 和 target_id
+        if not self_id or not target_id:
+            return False
+
+        # 目标必须是 bot 自己
+        if target_id != self_id:
+            return False
+
+        return True
+
+    def _get_bot_id(self, message: dict[str, Any]) -> Optional[str]:
+        """获取Bot自身的ID（优先从缓存或消息中获取）。"""
         bot_id = getattr(self, "_bot_id", None)
         if bot_id is None:
             bot_id = message.get("bot_id") or message.get("self_id")
         if bot_id is None:
-            return True
-        return bot_id in mentions
+            # 尝试从 self.ctx 获取（如果有）
+            if hasattr(self, "ctx") and hasattr(self.ctx, "bot"):
+                try:
+                    # 可能通过 bot.get_login_info 获取
+                    info = self.ctx.bot.get_login_info()
+                    if info and isinstance(info, dict):
+                        bot_id = info.get("user_id")
+                except Exception:
+                    pass
+        return str(bot_id) if bot_id else None
 
 
 # =========================================================
