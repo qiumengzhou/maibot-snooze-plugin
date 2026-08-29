@@ -18,8 +18,8 @@ import random
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, Tuple
 
-from maibot_sdk import MaiBotPlugin, EventHandler
-from maibot_sdk.types import EventType
+from maibot_sdk import HookHandler, MaiBotPlugin
+from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 from .config import SnoozeConfig
 from .models import (
@@ -67,6 +67,12 @@ class SnoozePlugin(MaiBotPlugin):
     async def on_load(self) -> None:
         """处理插件加载。"""
         self.ctx.logger.info("Snooze 插件加载完成，开始作息调度。")
+        
+        # ---- 主动初始化配置中的群聊 ----
+        for gid in self.config.filter.group_ids:
+            self.state_manager.get_or_create(str(gid))
+            self.ctx.logger.debug(f"[Snooze] 预创建群聊会话: {gid}")
+        
         self._timer_task = asyncio.create_task(self._timer_loop())
 
     async def on_unload(self) -> None:
@@ -89,21 +95,23 @@ class SnoozePlugin(MaiBotPlugin):
 
     async def _timer_loop(self):
         while True:
-            await asyncio.sleep(self.config.slot_minutes * 60)
+            await asyncio.sleep(self.config.wake.slot_minutes * 60)
             now = datetime.now()
-            for sid in self.state_manager.get_all_ids():
+            active_sessions = self.state_manager.get_all_ids()
+            if not active_sessions:
+                self.ctx.logger.debug("[Snooze] 当前无活跃会话，跳过状态检查")
+                continue
+            for sid in active_sessions:
                 old = self.state_manager.get_or_create(sid)
                 new, changed, transition_type = apply_transition(old, now, self.config)
                 if changed:
                     self.state_manager.update(sid, new)
-                    self.ctx.logger.debug(f"[{sid}] 状态变更: {old.state} -> {new.state}, sub={new.sub_state}")
+                    self.ctx.logger.info(f"[{sid}] 状态变更: {old.state} -> {new.state}, sub={new.sub_state}")
 
                     # ---- 发送预设消息（不经过LLM） ----
                     if transition_type == "woke_up":
-                        # 睡醒 → 发送 "早ﾉ☀"
                         await self._send_preset_message(sid, self.MSG_WOKE_UP)
                     elif transition_type == "fell_asleep":
-                        # 入睡 → 发送 "Zzz🌙"
                         await self._send_preset_message(sid, self.MSG_FELL_ASLEEP)
 
     # =========================================================
@@ -118,55 +126,70 @@ class SnoozePlugin(MaiBotPlugin):
             self.ctx.logger.warning(f"[Snooze] 发送预设消息失败: {e}")
 
     # =========================================================
-    # 消息拦截 (EventHandler)
+    # 消息拦截 (HookHandler) — 参考防抖插件
     # =========================================================
 
-    @EventHandler(
-        "snooze_message_handler",
+    @HookHandler(
+        "chat.receive.before_process",
+        name="snooze_message_handler",
         description="作息模拟消息拦截器，根据当前作息状态决定放行或拦截",
-        event_type=EventType.ON_MESSAGE_PRE_PROCESS,
+        mode=HookMode.BLOCKING,
+        order=HookOrder.FIRST,
+        timeout_ms=5000,
+        error_policy=ErrorPolicy.SKIP,
     )
-    async def on_message(
-        self,
-        message: Any = None,
-        stream_id: str = "",
-        **kwargs: Any
-    ) -> Tuple[bool, bool, Any, str, Optional[Dict[str, Any]]]:
+    async def handle_message(self, message: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any] | None:
         """
         处理所有入站消息，根据作息状态决定拦截或放行。
 
-        返回值格式: (handled, success, message, new_stream_id, extra)
+        返回值格式:
+            - None: 放行，不影响后续处理
+            - {"action": "abort"}: 拦截，中止后续处理
+            - {"action": "continue", "modified_kwargs": {"message": modified_message}}: 放行并修改消息
         """
-        # 1. 提取会话信息
-        is_group = False
-        session_id = stream_id
+        # 1. 插件开关检查
+        if not self.config.plugin.enabled:
+            return None
 
-        if isinstance(message, dict):
-            is_group = message.get("is_group", False)
-            session_id = str(message.get("group_id") if is_group else message.get("user_id", stream_id))
-        elif hasattr(message, "group_id"):
-            is_group = message.group_id is not None
-            session_id = str(message.group_id if is_group else message.user_id)
+        # 2. 提取会话信息
+        if not isinstance(message, dict):
+            return None
 
-        # 2. 会话过滤（黑白名单）
+        is_group = bool(message.get("is_group", False))
+        
+        # 提取 session_id / stream_id
+        session_id = str(message.get("session_id") or message.get("stream_id") or "")
+        if not session_id:
+            info = message.get("message_info") if isinstance(message.get("message_info"), dict) else {}
+            group_info = info.get("group_info") if isinstance(info.get("group_info"), dict) else {}
+            user_info = info.get("user_info") if isinstance(info.get("user_info"), dict) else {}
+            session_id = str(group_info.get("group_id") if is_group else user_info.get("user_id") or "")
+
+        if not session_id:
+            # 无法提取会话ID，放行
+            return None
+
+        # 3. 会话过滤（黑白名单）
         if not self._is_allowed(session_id, is_group):
-            return True, True, None, stream_id, None
+            return None  # 放行，插件透明
 
-        # 3. 获取当前状态
+        # 4. 获取或创建当前状态
         state = self.state_manager.get_or_create(session_id)
 
-        # 4. 状态分流
+        # 5. 状态分流
+        # 分支A：清醒 -> 放行
         if state.is_awake():
-            return True, True, None, stream_id, None
+            return None
 
+        # 分支B：睡觉 -> 拦截或尝试吵醒
         if state.is_asleep():
-            # ★ 修改：加上 await，因为 _handle_sleeping 现在是异步方法
-            return await self._handle_sleeping(message, stream_id, session_id, state)
+            return await self._handle_sleeping(message, session_id, state)
 
+        # 分支C：吵醒 -> 放行（可能注入前缀）
         if state.is_pissed():
-            return self._inject_if_angry(message, stream_id, state)
+            return self._inject_if_angry(message, state)
 
-        return True, True, None, stream_id, None
+        return None
 
     # =========================================================
     # 会话过滤
@@ -174,11 +197,11 @@ class SnoozePlugin(MaiBotPlugin):
 
     def _is_allowed(self, session_id: str, is_group: bool) -> bool:
         if is_group:
-            mode = self.config.group_filter
-            ids = self.config.group_ids
+            mode = self.config.filter.group_filter
+            ids = self.config.filter.group_ids
         else:
-            mode = self.config.pm_filter
-            ids = self.config.pm_ids
+            mode = self.config.filter.pm_filter
+            ids = self.config.filter.pm_ids
 
         if mode == "whitelist":
             return session_id in ids
@@ -191,11 +214,10 @@ class SnoozePlugin(MaiBotPlugin):
 
     async def _handle_sleeping(
         self,
-        message: Any,
-        stream_id: str,
+        message: dict[str, Any],
         session_id: str,
         state: SessionState
-    ) -> Tuple[bool, bool, Any, str, Optional[Dict[str, Any]]]:
+    ) -> dict[str, Any] | None:
         """处理睡觉状态下的@计数和吵醒。"""
         now = datetime.now()
         cfg = self.config
@@ -203,7 +225,9 @@ class SnoozePlugin(MaiBotPlugin):
         is_mentioned = self._is_mentioned(message)
 
         if not is_mentioned:
-            return True, True, None, stream_id, {"intercept_message": True}
+            # 静默拦截
+            self.ctx.logger.debug(f"[{session_id}] 睡觉中，拦截消息（未被@）")
+            return {"action": "abort"}
 
         # 滑动窗口计数
         if state.ping_window_start is None:
@@ -211,7 +235,7 @@ class SnoozePlugin(MaiBotPlugin):
             state.ping_count = 0
 
         elapsed = (now - state.ping_window_start).total_seconds()
-        if elapsed > cfg.slot_minutes * 60:
+        if elapsed > cfg.wake.slot_minutes * 60:
             state.ping_window_start = now
             state.ping_count = 0
 
@@ -219,22 +243,26 @@ class SnoozePlugin(MaiBotPlugin):
         self.state_manager.update(session_id, state)
 
         # 达到阈值 && 概率命中 -> 吵醒
-        if state.ping_count >= cfg.ping_threshold and random.random() < cfg.ping_wake_prob:
+        if state.ping_count >= cfg.pissed.ping_threshold and random.random() < cfg.pissed.ping_wake_prob:
             new_state = SessionState(
                 state=STATE_PISSED,
                 sub_state=SUB_ANGRY,
-                angry_until=now + timedelta(minutes=cfg.slot_minutes * cfg.anger_slots),
+                angry_until=now + timedelta(minutes=cfg.wake.slot_minutes * cfg.pissed.anger_slots),
                 ping_count=0,
                 ping_window_start=None
             )
             self.state_manager.update(session_id, new_state)
 
+            self.ctx.logger.info(f"[{session_id}] 被@吵醒！触发次数: {state.ping_count}")
+
             # ---- 被吵醒 → 发送 "白金吵闹💢"（不经过LLM） ----
-            await self._send_preset_message(stream_id, self.MSG_WAS_WOKEN)
+            await self._send_preset_message(session_id, self.MSG_WAS_WOKEN)
 
-            return self._inject_if_angry(message, stream_id, new_state)
+            return self._inject_if_angry(message, new_state)
 
-        return True, True, None, stream_id, {"intercept_message": True}
+        # 未达阈值或概率未命中 -> 拦截
+        self.ctx.logger.debug(f"[{session_id}] 睡觉中，@计数 {state.ping_count}/{cfg.pissed.ping_threshold}，拦截")
+        return {"action": "abort"}
 
     # =========================================================
     # 前缀注入
@@ -242,43 +270,51 @@ class SnoozePlugin(MaiBotPlugin):
 
     def _inject_if_angry(
         self,
-        message: Any,
-        stream_id: str,
+        message: dict[str, Any],
         state: SessionState
-    ) -> Tuple[bool, bool, Any, str, Optional[Dict[str, Any]]]:
+    ) -> dict[str, Any] | None:
         """如果处于生气状态，在用户消息前注入前缀。"""
         if state.is_angry():
-            prefix = self.config.angry_prefix
-            if isinstance(message, dict):
-                original = message.get("plain_text", "") or message.get("content", "")
-                message["plain_text"] = f"{prefix}\n{original}"
-                if "content" in message:
-                    message["content"] = f"{prefix}\n{message.get('content', '')}"
-            elif hasattr(message, "content"):
-                original = message.content
-                message.content = f"{prefix}\n{original}"
-        return True, True, None, stream_id, None
+            prefix = self.config.pissed.angry_prefix
+            
+            # 修改消息内容
+            original = message.get("processed_plain_text", "") or message.get("plain_text", "")
+            message["processed_plain_text"] = f"{prefix}\n{original}"
+            message["plain_text"] = f"{prefix}\n{original}"
+            
+            # 也修改 raw_message 中的文本
+            raw = message.get("raw_message")
+            if isinstance(raw, list):
+                for part in raw:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        data = part.get("data", "")
+                        part["data"] = f"{prefix}\n{data}"
+                        break
+                else:
+                    # 没有文本节点，插入一个
+                    raw.insert(0, {"type": "text", "data": f"{prefix}\n"})
+            
+            self.ctx.logger.debug(f"[Snooze] 注入愤怒前缀")
+            return {"action": "continue", "modified_kwargs": {"message": message}}
+        
+        return None  # 放行
 
     # =========================================================
     # @检测
     # =========================================================
 
-    def _is_mentioned(self, message: Any) -> bool:
+    def _is_mentioned(self, message: dict[str, Any]) -> bool:
         """检测消息中是否@了Bot。"""
-        if isinstance(message, dict):
-            mentions = message.get("mentions", [])
-            if mentions:
-                bot_id = getattr(self, "_bot_id", None)
-                if bot_id is None:
-                    return True
-                return bot_id in mentions
-            return False
-
-        mentions = getattr(message, "mentions", [])
+        mentions = message.get("mentions", [])
         if not mentions:
             return False
+        
         bot_id = getattr(self, "_bot_id", None)
         if bot_id is None:
+            # 尝试从消息中获取
+            bot_id = message.get("bot_id") or message.get("self_id")
+        if bot_id is None:
+            # 无法获取bot_id，只要有mentions就认为被@
             return True
         return bot_id in mentions
 

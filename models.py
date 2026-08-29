@@ -83,37 +83,35 @@ def apply_transition(state: SessionState, now: datetime, config: SnoozeConfig):
     old_state = state.state
 
     # ---- 第1步：强制执行（最高优先级） ----
-    if config.force_wake and is_time_past(config.force_wake_time, now):
+    if config.wake.force_wake and is_time_past(config.wake.force_wake_time, now):
         if new_state.state != STATE_AWAKE or new_state.sub_state is not None:
             new_state.state = STATE_AWAKE
             new_state.clear_anger()
             changed = True
-            # 强制起床也是"睡醒"
             if old_state != STATE_AWAKE:
                 transition_type = "woke_up"
         return new_state, changed, transition_type
 
-    if config.force_sleep and is_time_past(config.force_sleep_time, now):
+    if config.sleep.force_sleep and is_time_past(config.sleep.force_sleep_time, now):
         if new_state.state != STATE_ASLEEP or new_state.sub_state is not None:
             new_state.state = STATE_ASLEEP
             new_state.clear_anger()
             changed = True
-            # 强制睡觉也是"入睡"
             if old_state != STATE_ASLEEP:
                 transition_type = "fell_asleep"
         return new_state, changed, transition_type
 
     # ---- 第2步：清醒 -> 睡觉（熬夜判定） ----
-    if new_state.is_awake() and is_time_past(config.sleep_start, now):
-        if random.random() >= config.stay_prob:  # 未命中熬夜 -> 入睡
+    if new_state.is_awake() and is_time_past(config.sleep.sleep_start, now):
+        if random.random() >= config.sleep.stay_prob:
             new_state.state = STATE_ASLEEP
             new_state.clear_anger()
             changed = True
             transition_type = "fell_asleep"
 
     # ---- 第3步：睡觉 -> 清醒（贪睡判定） ----
-    elif new_state.is_asleep() and is_time_past(config.wake_start, now):
-        if random.random() >= config.snooze_prob:  # 未命中贪睡 -> 起床
+    elif new_state.is_asleep() and is_time_past(config.wake.wake_start, now):
+        if random.random() >= config.wake.snooze_prob:
             new_state.state = STATE_AWAKE
             new_state.clear_anger()
             changed = True
@@ -121,7 +119,7 @@ def apply_transition(state: SessionState, now: datetime, config: SnoozeConfig):
 
     # ---- 第4步：吵醒 -> 睡觉（补觉判定） ----
     elif new_state.is_pissed():
-        if random.random() < config.resleep_prob:
+        if random.random() < config.pissed.resleep_prob:
             new_state.state = STATE_ASLEEP
             new_state.clear_anger()
             changed = True
@@ -133,6 +131,5 @@ def apply_transition(state: SessionState, now: datetime, config: SnoozeConfig):
             new_state.sub_state = SUB_CALM
             new_state.angry_until = None
             changed = True
-            # 消气不是入睡或睡醒，transition_type 保持 None
 
     return new_state, changed, transition_type

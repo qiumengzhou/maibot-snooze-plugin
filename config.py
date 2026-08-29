@@ -40,7 +40,7 @@ class FilterConfig(PluginConfigBase):
         description="群聊列表",
         json_schema_extra={
             "label": "群聊列表",
-            "placeholder": "['123456789']",
+            "placeholder": "123456789",
         }
     )
     pm_filter: str = Field(
@@ -56,7 +56,7 @@ class FilterConfig(PluginConfigBase):
         description="用户列表",
         json_schema_extra={
             "label": "用户列表",
-            "placeholder": "['123456789']",
+            "placeholder": "123456789",
         }
     )
 
