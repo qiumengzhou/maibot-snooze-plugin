@@ -16,7 +16,7 @@
 import asyncio
 import random
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 
 from maibot_sdk import HookHandler, MaiBotPlugin
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
@@ -29,19 +29,44 @@ from .models import (
 
 
 class StateManager:
-    """会话状态池管理（内存版）。"""
+    """
+    会话状态池管理
+    每个会话存储：状态对象 + stream_id（MaiBot内部格式）
+    """
     def __init__(self):
-        self._sessions: Dict[str, SessionState] = {}
+        self._sessions: Dict[str, Dict[str, Any]] = {}
 
     def get_or_create(self, session_id: str) -> SessionState:
+        """获取或创建会话状态对象。"""
         if session_id not in self._sessions:
-            self._sessions[session_id] = SessionState()
-        return self._sessions[session_id]
+            self._sessions[session_id] = {
+                "state": SessionState(),
+                "stream_id": ""
+            }
+        return self._sessions[session_id]["state"]
 
     def update(self, session_id: str, state: SessionState) -> None:
-        self._sessions[session_id] = state
+        """更新会话状态。"""
+        if session_id not in self._sessions:
+            self._sessions[session_id] = {"state": state, "stream_id": ""}
+        else:
+            self._sessions[session_id]["state"] = state
+
+    def set_stream_id(self, session_id: str, stream_id: str) -> None:
+        """存储会话对应的真实 stream_id（MaiBot内部格式）。"""
+        if session_id not in self._sessions:
+            self._sessions[session_id] = {"state": SessionState(), "stream_id": stream_id}
+        else:
+            self._sessions[session_id]["stream_id"] = stream_id
+
+    def get_stream_id(self, session_id: str) -> str:
+        """获取会话对应的真实 stream_id。"""
+        if session_id in self._sessions:
+            return self._sessions[session_id].get("stream_id", "")
+        return ""
 
     def get_all_ids(self) -> list:
+        """获取所有会话 ID。"""
         return list(self._sessions.keys())
 
 
@@ -65,14 +90,14 @@ class SnoozePlugin(MaiBotPlugin):
     # =========================================================
 
     async def on_load(self) -> None:
-        """处理插件加载。"""
-        self.ctx.logger.info("Snooze 插件加载完成，开始作息调度。")
-        
+        """处理插件加载"""
+        self.ctx.logger.info("[Snooze] 插件加载完成，开始作息调度。")
+
         # ---- 主动初始化配置中的群聊 ----
         for gid in self.config.filter.group_ids:
             self.state_manager.get_or_create(str(gid))
             self.ctx.logger.debug(f"[Snooze] 预创建群聊会话: {gid}")
-        
+
         self._timer_task = asyncio.create_task(self._timer_loop())
 
     async def on_unload(self) -> None:
@@ -83,11 +108,11 @@ class SnoozePlugin(MaiBotPlugin):
                 await self._timer_task
             except asyncio.CancelledError:
                 pass
-        self.ctx.logger.info("Snooze 插件已卸载。")
+        self.ctx.logger.info("[Snooze] 插件已卸载。")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         """处理配置热重载事件。"""
-        self.ctx.logger.info("Snooze 配置已更新。")
+        self.ctx.logger.info("[Snooze] 配置已更新。")
 
     # =========================================================
     # 定时器循环
@@ -101,6 +126,7 @@ class SnoozePlugin(MaiBotPlugin):
             if not active_sessions:
                 self.ctx.logger.debug("[Snooze] 当前无活跃会话，跳过状态检查")
                 continue
+
             for sid in active_sessions:
                 old = self.state_manager.get_or_create(sid)
                 new, changed, transition_type = apply_transition(old, now, self.config)
@@ -108,25 +134,32 @@ class SnoozePlugin(MaiBotPlugin):
                     self.state_manager.update(sid, new)
                     self.ctx.logger.info(f"[{sid}] 状态变更: {old.state} -> {new.state}, sub={new.sub_state}")
 
-                    # ---- 发送预设消息（不经过LLM） ----
+                    # ---- 发送预设消息 ----
+                    stream_id = self.state_manager.get_stream_id(sid)
+                    if not stream_id:
+                        self.ctx.logger.warning(f"[{sid}] 未找到 stream_id，无法发送预设消息")
+                        continue
+
                     if transition_type == "woke_up":
-                        await self._send_preset_message(sid, self.MSG_WOKE_UP)
+                        await self._send_preset_message(stream_id, self.MSG_WOKE_UP)
                     elif transition_type == "fell_asleep":
-                        await self._send_preset_message(sid, self.MSG_FELL_ASLEEP)
+                        await self._send_preset_message(stream_id, self.MSG_FELL_ASLEEP)
 
     # =========================================================
     # 预设消息发送
     # =========================================================
 
     async def _send_preset_message(self, stream_id: str, text: str) -> None:
-        """发送预设消息（不经过LLM，直接发送文本）。"""
+        """发送预设消息（不经过LLM，直接发送文本）"""
         try:
+            # 直接使用 MaiBot 内部的 stream_id
             await self.ctx.send.text(text, stream_id)
+            self.ctx.logger.debug(f"[Snooze] 发送预设消息: {text} -> {stream_id}")
         except Exception as e:
             self.ctx.logger.warning(f"[Snooze] 发送预设消息失败: {e}")
 
     # =========================================================
-    # 消息拦截 (HookHandler) — 参考防抖插件
+    # 消息拦截 (HookHandler)
     # =========================================================
 
     @HookHandler(
@@ -134,19 +167,22 @@ class SnoozePlugin(MaiBotPlugin):
         name="snooze_message_handler",
         description="作息模拟消息拦截器，根据当前作息状态决定放行或拦截",
         mode=HookMode.BLOCKING,
-        order=HookOrder.FIRST,
+        order=HookOrder.EARLY,      # 最高拦截优先级
         timeout_ms=5000,
         error_policy=ErrorPolicy.SKIP,
     )
     async def handle_message(self, message: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any] | None:
         """
-        处理所有入站消息，根据作息状态决定拦截或放行。
+        处理所有入站消息，根据作息状态决定拦截或放行
 
         返回值格式:
             - None: 放行，不影响后续处理
             - {"action": "abort"}: 拦截，中止后续处理
             - {"action": "continue", "modified_kwargs": {"message": modified_message}}: 放行并修改消息
         """
+        # 调试日志：确认插件被调用
+        self.ctx.logger.debug("[Snooze] handle_message 被调用")
+
         # 1. 插件开关检查
         if not self.config.plugin.enabled:
             return None
@@ -155,23 +191,43 @@ class SnoozePlugin(MaiBotPlugin):
         if not isinstance(message, dict):
             return None
 
-        is_group = bool(message.get("is_group", False))
-        
-        # 提取 session_id / stream_id
-        session_id = str(message.get("session_id") or message.get("stream_id") or "")
-        if not session_id:
+        # ---- 提取 stream_id（直接使用 MaiBot 内部格式） ----
+        real_stream_id = message.get("stream_id") or message.get("session_id") or ""
+        if not real_stream_id:
+            # 尝试从 message_info 中提取
             info = message.get("message_info") if isinstance(message.get("message_info"), dict) else {}
-            group_info = info.get("group_info") if isinstance(info.get("group_info"), dict) else {}
-            user_info = info.get("user_info") if isinstance(info.get("user_info"), dict) else {}
-            session_id = str(group_info.get("group_id") if is_group else user_info.get("user_id") or "")
+            real_stream_id = info.get("session_id") or info.get("stream_id") or ""
 
-        if not session_id:
-            # 无法提取会话ID，放行
+        if not real_stream_id:
+            self.ctx.logger.debug("[Snooze] 无法提取 stream_id，放行")
             return None
+
+        # ---- 提取群号/用户ID（用于黑白名单） ----
+        info = message.get("message_info") if isinstance(message.get("message_info"), dict) else {}
+        group_info = info.get("group_info") if isinstance(info.get("group_info"), dict) else {}
+        user_info = info.get("user_info") if isinstance(info.get("user_info"), dict) else {}
+        group_id = str(group_info.get("group_id") or "")
+        user_id = str(user_info.get("user_id") or "")
+
+        if group_id:
+            is_group = True
+            session_id = group_id
+            self.ctx.logger.debug(f"[Snooze] 群聊消息 -> 群号: {group_id}, stream_id: {real_stream_id}")
+        elif user_id:
+            is_group = False
+            session_id = user_id
+            self.ctx.logger.debug(f"[Snooze] 私聊消息 -> 用户ID: {user_id}, stream_id: {real_stream_id}")
+        else:
+            self.ctx.logger.debug("[Snooze] 无法提取群号/用户ID，放行")
+            return None
+
+        # 存储真实的 stream_id（MaiBot 内部格式，如 1fb09f6e9d8dec317f398478f4777c0f）
+        self.state_manager.set_stream_id(session_id, real_stream_id)
 
         # 3. 会话过滤（黑白名单）
         if not self._is_allowed(session_id, is_group):
-            return None  # 放行，插件透明
+            self.ctx.logger.debug(f"[{session_id}] 不在黑白名单中，放行")
+            return None
 
         # 4. 获取或创建当前状态
         state = self.state_manager.get_or_create(session_id)
@@ -179,14 +235,17 @@ class SnoozePlugin(MaiBotPlugin):
         # 5. 状态分流
         # 分支A：清醒 -> 放行
         if state.is_awake():
+            self.ctx.logger.debug(f"[{session_id}] 状态: 清醒，放行")
             return None
 
         # 分支B：睡觉 -> 拦截或尝试吵醒
         if state.is_asleep():
+            self.ctx.logger.debug(f"[{session_id}] 状态: 睡觉，进入处理")
             return await self._handle_sleeping(message, session_id, state)
 
         # 分支C：吵醒 -> 放行（可能注入前缀）
         if state.is_pissed():
+            self.ctx.logger.debug(f"[{session_id}] 状态: 吵醒，检查注入")
             return self._inject_if_angry(message, state)
 
         return None
@@ -218,7 +277,7 @@ class SnoozePlugin(MaiBotPlugin):
         session_id: str,
         state: SessionState
     ) -> dict[str, Any] | None:
-        """处理睡觉状态下的@计数和吵醒。"""
+        """处理睡觉状态下的@计数和吵醒"""
         now = datetime.now()
         cfg = self.config
 
@@ -226,7 +285,7 @@ class SnoozePlugin(MaiBotPlugin):
 
         if not is_mentioned:
             # 静默拦截
-            self.ctx.logger.debug(f"[{session_id}] 睡觉中，拦截消息（未被@）")
+            self.ctx.logger.info(f"[{session_id}] 🛌 睡觉中，拦截消息（未被@）")
             return {"action": "abort"}
 
         # 滑动窗口计数
@@ -242,6 +301,8 @@ class SnoozePlugin(MaiBotPlugin):
         state.ping_count += 1
         self.state_manager.update(session_id, state)
 
+        self.ctx.logger.info(f"[{session_id}] 🛌 睡觉中，收到 @，计数 {state.ping_count}/{cfg.pissed.ping_threshold}")
+
         # 达到阈值 && 概率命中 -> 吵醒
         if state.ping_count >= cfg.pissed.ping_threshold and random.random() < cfg.pissed.ping_wake_prob:
             new_state = SessionState(
@@ -253,15 +314,19 @@ class SnoozePlugin(MaiBotPlugin):
             )
             self.state_manager.update(session_id, new_state)
 
-            self.ctx.logger.info(f"[{session_id}] 被@吵醒！触发次数: {state.ping_count}")
+            self.ctx.logger.info(f"[{session_id}] 🔥 被@吵醒！")
 
-            # ---- 被吵醒 → 发送 "白金吵闹💢"（不经过LLM） ----
-            await self._send_preset_message(session_id, self.MSG_WAS_WOKEN)
+            # ---- 被吵醒 → 发送 "白金吵闹💢" ----
+            stream_id = self.state_manager.get_stream_id(session_id)
+            if stream_id:
+                await self._send_preset_message(stream_id, self.MSG_WAS_WOKEN)
+            else:
+                self.ctx.logger.warning(f"[{session_id}] 未找到 stream_id，无法发送吵醒消息")
 
             return self._inject_if_angry(message, new_state)
 
         # 未达阈值或概率未命中 -> 拦截
-        self.ctx.logger.debug(f"[{session_id}] 睡觉中，@计数 {state.ping_count}/{cfg.pissed.ping_threshold}，拦截")
+        self.ctx.logger.info(f"[{session_id}] 🛌 睡觉中，@计数 {state.ping_count}/{cfg.pissed.ping_threshold}，拦截")
         return {"action": "abort"}
 
     # =========================================================
@@ -273,15 +338,15 @@ class SnoozePlugin(MaiBotPlugin):
         message: dict[str, Any],
         state: SessionState
     ) -> dict[str, Any] | None:
-        """如果处于生气状态，在用户消息前注入前缀。"""
+        """如果处于生气状态，在用户消息前注入前缀"""
         if state.is_angry():
             prefix = self.config.pissed.angry_prefix
-            
+
             # 修改消息内容
             original = message.get("processed_plain_text", "") or message.get("plain_text", "")
             message["processed_plain_text"] = f"{prefix}\n{original}"
             message["plain_text"] = f"{prefix}\n{original}"
-            
+
             # 也修改 raw_message 中的文本
             raw = message.get("raw_message")
             if isinstance(raw, list):
@@ -293,10 +358,10 @@ class SnoozePlugin(MaiBotPlugin):
                 else:
                     # 没有文本节点，插入一个
                     raw.insert(0, {"type": "text", "data": f"{prefix}\n"})
-            
+
             self.ctx.logger.debug(f"[Snooze] 注入愤怒前缀")
             return {"action": "continue", "modified_kwargs": {"message": message}}
-        
+
         return None  # 放行
 
     # =========================================================
@@ -308,7 +373,7 @@ class SnoozePlugin(MaiBotPlugin):
         mentions = message.get("mentions", [])
         if not mentions:
             return False
-        
+
         bot_id = getattr(self, "_bot_id", None)
         if bot_id is None:
             # 尝试从消息中获取
@@ -324,5 +389,5 @@ class SnoozePlugin(MaiBotPlugin):
 # =========================================================
 
 def create_plugin() -> SnoozePlugin:
-    """创建打盹儿插件实例。"""
+    """创建打盹儿插件实例"""
     return SnoozePlugin()
