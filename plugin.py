@@ -26,7 +26,7 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 from .config import SnoozeConfig
 from .models import (
-    SessionState, STATE_ASLEEP, STATE_PISSED, SUB_ANGRY,
+    SessionState, STATE_AWAKE, STATE_ASLEEP, STATE_PISSED, SUB_ANGRY,
     _is_in_time_window, apply_transition, TransitionType
 )
 
