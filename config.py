@@ -15,9 +15,18 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "启用插件"},
     )
     config_version: str = Field(
-        default="1.0.0",
+        default="1.1.0",
         description="配置版本号",
         json_schema_extra={"label": "配置版本"},
+    )
+
+    timezone: str = Field(
+        default="UTC+8",
+        description="插件使用的时区。可选: 'UTC+8'(北京时间) 或 'UTC'(协调世界时)",
+        json_schema_extra={
+            "label": "时区",
+            "placeholder": "UTC+8 or UTC",
+        }
     )
 
 
@@ -32,7 +41,7 @@ class FilterConfig(PluginConfigBase):
         description="群聊过滤模式，可选 whitelist / blacklist",
         json_schema_extra={
             "label": "群聊过滤模式",
-            "placeholder": "whitelist 或 blacklist",
+            "placeholder": "whitelist or blacklist",
         }
     )
     group_ids: List[str] = Field(
@@ -48,7 +57,7 @@ class FilterConfig(PluginConfigBase):
         description="私聊过滤模式，可选 whitelist / blacklist",
         json_schema_extra={
             "label": "私聊过滤模式",
-            "placeholder": "whitelist 或 blacklist",
+            "placeholder": "whitelist or blacklist",
         }
     )
     pm_ids: List[str] = Field(
@@ -91,14 +100,6 @@ class WakeConfig(PluginConfigBase):
             "placeholder": "0 ~ 1",
         }
     )
-    force_wake: bool = Field(
-        default=True,
-        description="启用强制起床",
-        json_schema_extra={
-            "label": "启用强制起床",
-            "placeholder": "true / false",
-        }
-    )
     force_wake_time: str = Field(
         default="11:00",
         description="强制起床时间点",
@@ -129,14 +130,6 @@ class SleepConfig(PluginConfigBase):
         json_schema_extra={
             "label": "熬夜概率",
             "placeholder": "0 ~ 1",
-        }
-    )
-    force_sleep: bool = Field(
-        default=True,
-        description="启用强制睡觉",
-        json_schema_extra={
-            "label": "启用强制睡觉",
-            "placeholder": "true / false",
         }
     )
     force_sleep_time: str = Field(

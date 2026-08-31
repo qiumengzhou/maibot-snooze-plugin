@@ -19,6 +19,7 @@ import random
 import re
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
+from zoneinfo import ZoneInfo
 
 from maibot_sdk import HookHandler, MaiBotPlugin
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
@@ -26,9 +27,8 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 from .config import SnoozeConfig
 from .models import (
     SessionState, STATE_ASLEEP, STATE_PISSED, SUB_ANGRY,
-    apply_transition, TransitionType
+    _is_in_time_window, apply_transition, TransitionType
 )
-
 
 class StateManager:
     """
@@ -86,6 +86,7 @@ class SnoozePlugin(MaiBotPlugin):
         super().__init__()
         self.state_manager = StateManager()
         self._timer_task: Optional[asyncio.Task] = None
+        self._tz = ZoneInfo("UTC")  # 默认值
 
     # =========================================================
     # 生命周期
@@ -95,10 +96,40 @@ class SnoozePlugin(MaiBotPlugin):
         """处理插件加载"""
         self.ctx.logger.info("[Snooze] 插件加载完成，开始作息调度")
 
-        # ---- 主动初始化配置中的群聊 ----
+        # ---- 根据配置设置时区 ----
+        tz_str = getattr(self.config.plugin, "timezone", "UTC+8")
+        if tz_str == "UTC+8":
+            # 北京时间使用 Asia/Shanghai
+            tz_str = "Asia/Shanghai"
+        elif tz_str == "UTC":
+            tz_str = "UTC"
+        try:
+            self._tz = ZoneInfo(tz_str)
+            self.ctx.logger.debug(f"[Snooze] 使用时区: {tz_str}")
+        except Exception as e:
+            self.ctx.logger.warning(f"[Snooze] 无法解析时区 '{tz_str}'，回退到 UTC: {e}")
+            self._tz = ZoneInfo("UTC")
+
+        # ---- 判断初始状态：睡觉 清醒 ----
+        now = self._get_now()
+        sleep_start = self.config.sleep.sleep_start
+        wake_start = self.config.wake.wake_start
+        if _is_in_time_window(now, sleep_start, wake_start):
+            initial_state = STATE_ASLEEP
+        else:
+            initial_state = STATE_AWAKE
+
+        self.ctx.logger.debug(f"[Snooze] 初始状态: {initial_state} (当前时间 {now.strftime('%H:%M')})")
+
+        # ---- 初始化配置中的群聊 ----
         for gid in self.config.filter.group_ids:
-            self.state_manager.get_or_create(str(gid))
-            self.ctx.logger.debug(f"[Snooze] 预创建群聊会话: {gid}")
+            session_id = str(gid)
+            state = SessionState(state=initial_state)
+            self.state_manager._sessions[session_id] = {
+                "state":state,
+                "stream_id": ""
+            }
+            self.ctx.logger.debug(f"[Snooze] 预创建群聊会话: {gid}, 初始状态: {initial_state}")
 
         self._timer_task = asyncio.create_task(self._timer_loop())
 
@@ -115,6 +146,21 @@ class SnoozePlugin(MaiBotPlugin):
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
         """处理配置热重载事件。"""
         self.ctx.logger.info("[Snooze] 配置已更新")
+        # 更新时区
+        tz_str = getattr(self.config.plugin, "timezone", "UTC+8")
+        if tz_str == "UTC+8":
+            tz_str = "Asia/Shanghai"
+        elif tz_str == "UTC":
+            tz_str = "UTC"
+        try:
+            self._tz = ZoneInfo(tz_str)
+            self.ctx.logger.debug(f"[Snooze] 时区已更新为: {tz_str}")
+        except Exception as e:
+            self.ctx.logger.warning(f"[Snooze] 时区更新失败，保持原有: {e}")
+
+    def _get_now(self) -> datetime:
+        """返回当前时间（带时区）"""
+        return datetime.now(self._tz)
 
     # =========================================================
     # 定时器循环
@@ -123,7 +169,7 @@ class SnoozePlugin(MaiBotPlugin):
     async def _timer_loop(self):
         while True:
             await asyncio.sleep(self.config.wake.slot_minutes * 60)
-            now = datetime.now()
+            now = self._get_now()
             active_sessions = self.state_manager.get_all_ids()
             if not active_sessions:
                 self.ctx.logger.debug("[Snooze] 当前无活跃会话，跳过状态检查")
@@ -131,21 +177,37 @@ class SnoozePlugin(MaiBotPlugin):
 
             for sid in active_sessions:
                 old = self.state_manager.get_or_create(sid)
+                
+                # ---- 记录当前状态和时间 ----
+                self.ctx.logger.debug(f"[{sid}] 定时器检查: 当前状态={old.state}, 时间={now.strftime('%H:%M')}")
+
                 new, changed, transition_type = apply_transition(old, now, self.config)
-                if changed:
-                    self.state_manager.update(sid, new)
-                    self.ctx.logger.info(f"[{sid}] 状态变更: {old.state} -> {new.state}, sub={new.sub_state}")
+                
+                # ---- 判定未成功输出原因 ----
+                if not changed:
+                    if old.is_awake() and _is_in_time_window(now, self.config.sleep.sleep_start, self.config.sleep.force_sleep_time):
+                        self.ctx.logger.info(f"[{sid}] 熬夜判定: 命中熬夜概率 (stay_prob={self.config.sleep.stay_prob})，保持清醒")
+                    elif old.is_asleep() and _is_in_time_window(now, self.config.wake.wake_start, self.config.wake.force_wake_time):
+                        self.ctx.logger.info(f"[{sid}] 贪睡判定: 命中贪睡概率 (snooze_prob={self.config.wake.snooze_prob})，继续睡觉")
+                    elif old.is_pissed():
+                        self.ctx.logger.info(f"[{sid}] 补觉判定: 未命中补觉概率 (resleep_prob={self.config.pissed.resleep_prob})，保持吵醒")
+                    # 还没到判定时间
+                    continue
 
-                    # ---- 发送预设消息 ----
-                    stream_id = self.state_manager.get_stream_id(sid)
-                    if not stream_id:
-                        self.ctx.logger.warning(f"[{sid}] 未找到 stream_id，无法发送预设消息")
-                        continue
+                # ---- 状态变更 ----
+                self.state_manager.update(sid, new)
+                self.ctx.logger.info(f"[{sid}] 状态变更: {old.state} -> {new.state}, sub={new.sub_state}")
 
-                    if transition_type == "woke_up":
-                        await self._send_preset_message(stream_id, self.MSG_WOKE_UP)
-                    elif transition_type == "fell_asleep":
-                        await self._send_preset_message(stream_id, self.MSG_FELL_ASLEEP)
+                # ---- 发送预设消息 ----
+                stream_id = self.state_manager.get_stream_id(sid)
+                if not stream_id:
+                    self.ctx.logger.debug(f"[{sid}] 未找到 stream_id，无法发送预设消息")
+                    continue
+
+                if transition_type == "woke_up":
+                    await self._send_preset_message(stream_id, self.MSG_WOKE_UP)
+                elif transition_type == "fell_asleep":
+                    await self._send_preset_message(stream_id, self.MSG_FELL_ASLEEP)
 
     # =========================================================
     # 预设消息发送
@@ -268,7 +330,7 @@ class SnoozePlugin(MaiBotPlugin):
         state: SessionState
     ) -> dict[str, Any] | None:
         """处理睡觉状态下的 @/戳 计数和吵醒"""
-        now = datetime.now()
+        now = self._get_now()
         cfg = self.config
 
         # 检测 @/戳
@@ -291,7 +353,6 @@ class SnoozePlugin(MaiBotPlugin):
         state.ping_count += 1
         self.state_manager.update(session_id, state)
 
-        # [修改] 日志改为 @/戳
         self.ctx.logger.info(f"[{session_id}] 睡觉中，收到 @/戳，计数 {state.ping_count}/{cfg.pissed.ping_threshold}")
 
         # 达到阈值 && 概率命中 -> 吵醒
@@ -305,7 +366,6 @@ class SnoozePlugin(MaiBotPlugin):
             )
             self.state_manager.update(session_id, new_state)
 
-            # [修改] 日志改为 @/戳
             self.ctx.logger.info(f"[{session_id}] 被@/戳吵醒")
 
             # ---- ★ 只发送预设消息，不修改用户消息 ----
